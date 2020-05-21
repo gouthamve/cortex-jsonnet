@@ -1,5 +1,17 @@
 {
+  local volumeMount = $.core.v1.volumeMount,
+  local pvc = $.core.v1.persistentVolumeClaim,
+  local volume = $.core.v1.volume,
   local container = $.core.v1.container,
+  local statefulSet = $.apps.v1beta1.statefulSet,
+
+  _config+:: {
+    wal_dir: '/wal_data',
+    ingester+: {
+      statefulset_replicas: 3,
+      statefulset_disk: '150Gi',
+    },
+  },
 
   ingester_args::
     $._config.ringConfig +
@@ -29,6 +41,14 @@
       'ingester.max-series-per-metric': 0,  // Disabled in favour of the max global limit
       'limits.per-user-override-config': '/etc/cortex/overrides.yaml',
       'server.grpc-max-concurrent-streams': 100000,
+
+      // WAL.
+      'ingester.wal-enabled': true,
+      'ingester.checkpoint-enabled': true,
+      'ingester.recover-from-wal': true,
+      'ingester.wal-dir': $._config.wal_dir,
+      'ingester.checkpoint-duration': '15m',
+      'ingester.tokens-file-path': $._config.wal_dir + '/tokens',
     } + (
       if $._config.memcached_index_writes_enabled then
         {
@@ -43,35 +63,51 @@
 
   local name = 'ingester',
 
+  local ingester_pvc =
+    pvc.new() +
+    pvc.mixin.spec.resources.withRequests({ storage: $._config.ingester.statefulset_disk }) +
+    pvc.mixin.spec.withAccessModes(['ReadWriteOnce']) +
+    pvc.mixin.spec.withStorageClassName('fast') +
+    pvc.mixin.metadata.withName('ingester-pvc'),
+
   ingester_container::
     container.new(name, $._images.ingester) +
     container.withPorts($.ingester_ports) +
     container.withArgsMixin($.util.mapToFlags($.ingester_args)) +
+    container.withVolumeMountsMixin([
+      volumeMount.new('ingester-pvc', $._config.wal_dir),
+    ]) +
     $.util.resourcesRequests('4', '15Gi') +
     $.util.resourcesLimits(null, '25Gi') +
     $.util.readinessProbe +
     $.jaeger_mixin,
 
-  local deployment = $.apps.v1beta1.deployment,
+  statefulset_storage_config_mixin::
+    statefulSet.mixin.spec.template.metadata.withAnnotationsMixin({ schemaID: $._config.schemaID },) +
+    $.util.configVolumeMount('schema-' + $._config.schemaID, '/etc/cortex/schema'),
 
-  ingester_deployment_labels:: {},
+  ingester_statefulset_labels:: {},
 
-  ingester_deployment:
-    deployment.new(name, 3, [$.ingester_container], $.ingester_deployment_labels) +
-    $.util.antiAffinity +
+  ingester_statefulset:
+    statefulSet.new('ingester', $._config.ingester.statefulset_replicas, [$.ingester_container], ingester_pvc)
+    .withServiceName('ingester')
+    .withVolumes([volume.fromPersistentVolumeClaim('ingester-pvc', 'ingester-pvc')]) +
+    statefulSet.mixin.metadata.withNamespace($._config.namespace) +
+    statefulSet.mixin.metadata.withLabels({ name: 'ingester' }) +
+    statefulSet.mixin.spec.template.metadata.withLabels({ name: 'ingester' } + $.ingester_statefulset_labels) +
+    statefulSet.mixin.spec.selector.withMatchLabels({ name: 'ingester' }) +
+    statefulSet.mixin.spec.template.spec.securityContext.withRunAsUser(0) +
+    statefulSet.mixin.spec.template.spec.withTerminationGracePeriodSeconds(600) +
+    statefulSet.mixin.spec.updateStrategy.withType('RollingUpdate') +
+    $.statefulset_storage_config_mixin +
     $.util.configVolumeMount('overrides', '/etc/cortex') +
-    deployment.mixin.metadata.withLabels({ name: name }) +
-    deployment.mixin.spec.withMinReadySeconds(60) +
-    deployment.mixin.spec.strategy.rollingUpdate.withMaxSurge(0) +
-    deployment.mixin.spec.strategy.rollingUpdate.withMaxUnavailable(1) +
-    deployment.mixin.spec.template.spec.withTerminationGracePeriodSeconds(4800) +
-    $.storage_config_mixin +
-    $.util.podPriority('high'),
+    $.util.podPriority('high') +
+    $.util.antiAffinityStatefulSet,
 
   ingester_service_ignored_labels:: [],
 
   ingester_service:
-    $.util.serviceFor($.ingester_deployment, $.ingester_service_ignored_labels),
+    $.util.serviceFor($.ingester_statefulset, $.ingester_service_ignored_labels),
 
   local podDisruptionBudget = $.policy.v1beta1.podDisruptionBudget,
 
